@@ -4295,27 +4295,6 @@ CheckForSerializableConflictOut(Relation relation, TransactionId xid, Snapshot s
 	}
 
 	/*
-	 * Remotexact
-	 * If we have a rw dependency on a PREAPARED remote xact, it could be
-	 * a potential conflict and so we need to abort ourselves.
-	 *
-	 * It may be a false conflict and there may not be an edge in the remote
-	 * region, however, we have no way to know that without accessing the
-	 * dependency graph of the remote region. So we will abort to ensure
-	 * serializability.
-	 */
-
-	if (SxactIsRemotePrepared(sxact))
-	{
-		LWLockRelease(SerializableXactHashLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("could not serialize access due to read/write dependencies among transactions"),
-				 errdetail_internal("Reason code: Canceled on conflict out to prepared multi-region transaction."),
-				 errhint("The transaction might succeed if retried.")));
-	}
-
-	/*
 	 * If this is a read-only transaction and the writing transaction has
 	 * committed, and it doesn't have a rw-conflict to a transaction which
 	 * committed before it, no conflict.
@@ -4336,6 +4315,34 @@ CheckForSerializableConflictOut(Relation relation, TransactionId xid, Snapshot s
 		/* This write was already in our snapshot; no conflict. */
 		LWLockRelease(SerializableXactHashLock);
 		return;
+	}
+
+	/*
+	 * Remotexact
+	 * Rule 4: If we have a rw dependency on a PREAPARED remote writer, 
+	 * so we need to abort ourselves.
+	 * The current graph contains:
+	 * 			Tx --r/w--> Tr
+	 * However, we could have a new Tr' that forms the following structure
+	 * at the current region:
+	 * 			Tr' --r/w--> Tx --r/w--> Tr
+	 * Consequently, we could have another structure at the remote region:
+	 * 			Tr --r/w--> Ty --r/w--> Tr' 
+	 * 
+	 * It may be a false conflict and there may not be an edge in the remote
+	 * region, however, we have no way to know that without accessing the
+	 * dependency graph of the remote region. So we will abort to ensure
+	 * serializability.
+	 */
+
+	if (SxactIsRemotePrepared(sxact))
+	{
+		LWLockRelease(SerializableXactHashLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access due to read/write dependencies among transactions"),
+				 errdetail_internal("Reason code: Canceled on conflict out to prepared multi-region transaction."),
+				 errhint("The transaction might succeed if retried.")));
 	}
 
 	if (RWConflictExists(MySerializableXact, sxact))
@@ -4929,11 +4936,21 @@ PreCommit_CheckForSerializationFailure(void)
 {
 	RWConflict	nearConflict;
 	PGPROC 		*proc;
+	bool is_remote_xact;
 
 	if (MySerializableXact == InvalidSerializableXact)
 		return;
 
 	Assert(IsolationIsSerializable());
+
+	/*
+	 * Remotexact
+	 * The isRemoteXact flag captures both initiating and validating xacts.
+	 * We use this infromation to avoid any multi-region serialization failures.
+	 */
+	proc = MyProc;
+	pg_read_barrier();
+	is_remote_xact = proc->isRemoteXact;
 
 	LWLockAcquire(SerializableXactHashLock, LW_EXCLUSIVE);
 
@@ -4953,12 +4970,61 @@ PreCommit_CheckForSerializationFailure(void)
 				 errhint("The transaction might succeed if retried.")));
 	}
 
+	/*
+	 * Remotexact 
+	 * We want to avoid anti-dependencies related to OutConflicts. 
+	 * We want to abort the committing transaction if the writer is prepared/committed.
+	 * Remotexact is reading from a PREPARED/COMMITTED writer, so we need to abort.
+	 * Rule 3(b): Tr --r/w--> Tx. Tr is the current transaction, Tx is a committed writer.
+	*/
+	if (is_remote_xact) {
+		nearConflict = (RWConflict)
+			SHMQueueNext(&MySerializableXact->outConflicts,
+						&MySerializableXact->outConflicts,
+						offsetof(RWConflictData, outLink));
+		while (nearConflict) {
+			SERIALIZABLEXACT *writer = nearConflict->sxactIn;
+			if ((SxactIsPrepared(writer) || SxactIsCommitted(writer))) {
+				LWLockRelease(SerializableXactHashLock);
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							errmsg("could not serialize access due to read/write dependencies among transactions"),
+							errdetail_internal("Reason code: Canceled remote transaction on conflict out."),
+							errhint("The transaction might succeed if retried.")));
+			}
+
+			nearConflict = (RWConflict)
+				SHMQueueNext(&MySerializableXact->outConflicts,
+							&nearConflict->outLink,
+							offsetof(RWConflictData, outLink));
+		}
+	}
+
 	nearConflict = (RWConflict)
 		SHMQueueNext(&MySerializableXact->inConflicts,
 					 &MySerializableXact->inConflicts,
 					 offsetof(RWConflictData, inLink));
 	while (nearConflict)
 	{
+		/*
+		 * Remotexact
+		 * We avoid anti-depedencies with logiaclly concurrent remote transactions.
+		 * Rule 3(a): Tr --r/w--> Tx, where Tx is the current transaction, Tr is 
+		 * remote prepared but not committed, abort the current transaction. 
+		 * We don't abort for committed transactions with read-write anti-dependency
+		 * Tr' --r/w--> Tr --r/w--> Tx, where Tr' is logically concurrent
+		 * but not physically concurrent. Read validation will abort Tr'. 
+		 */
+		SERIALIZABLEXACT *reader = nearConflict->sxactOut;
+		if (!SxactIsCommitted(reader) && SxactIsRemotePrepared(reader)) {
+			LWLockRelease(SerializableXactHashLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						errmsg("could not serialize access due to read/write dependencies among transactions"),
+						errdetail_internal("Reason code: Canceled transaction due to in conflict with remote transaction."),
+						errhint("The transaction might succeed if retried.")));
+		}
+
 		if (!SxactIsCommitted(nearConflict->sxactOut)
 			&& !SxactIsDoomed(nearConflict->sxactOut))
 		{
@@ -4998,6 +5064,29 @@ PreCommit_CheckForSerializationFailure(void)
 								 &farConflict->inLink,
 								 offsetof(RWConflictData, inLink));
 			}
+			/*
+			 * Remotexact
+			 * Rule 4: We have a anti-dependency of the form:
+			 * 			Tx --r/w--> Tr, where Tr is the current transaction. 
+			 * We want to avoid any future unsafe structures of the form:
+			 * 		Tr' --r/w--> Tx --r/w --> Tr
+			 * If Tx is not committed, we abort it. 
+			 * If Tx is already committed, then any dependency with Tr' will cause validation failure.
+			 * If Tx is prepared, we abort ourselves to avoid Tr'-->Tx.
+			 *
+			 */
+			if (!SxactIsCommitted(reader) && is_remote_xact) {
+				if (SxactIsPrepared(reader)) {
+					LWLockRelease(SerializableXactHashLock);
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+								errmsg("could not serialize access due to read/write dependencies among transactions"),
+								errdetail_internal("Reason code: Canceled on commit attempt of remotexact with conflict in from prepared transaction."),
+								errhint("The transaction might succeed if retried.")));
+				} else {
+					reader->flags |= SXACT_FLAG_DOOMED;
+				}
+			}
 		}
 
 		nearConflict = (RWConflict)
@@ -5012,11 +5101,12 @@ PreCommit_CheckForSerializationFailure(void)
 	/* Remotexact
 	 * Mark the transaction as multi-region if necessary. This flag is used to
 	 * abort any future reads to avoid serializability failures.
-	 * The isRemoteXact flag captures both initiating and validating xacts.
+	 * Although we call it SXACT_FLAG_REMOTE_PREPARED, it is never unset for 
+	 * transactions. Even if the transaction is committed, it still marked
+	 * as remote prepared because there might be other regions where it is 
+	 * still in a prepared state.
 	*/
-	proc = MyProc;
-	pg_read_barrier();
-	if (proc->isRemoteXact)
+	if (is_remote_xact)
 		MySerializableXact->flags |= SXACT_FLAG_REMOTE_PREPARED;
 	LWLockRelease(SerializableXactHashLock);
 }
